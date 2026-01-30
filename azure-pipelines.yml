@@ -1,0 +1,252 @@
+name: $(BuildDefinitionName)_$(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+- master
+- develop
+- hotfix/*
+- release/*
+
+pool: 'On-Premise Agent - DEV'
+
+variables:
+  buildConfiguration: 'Release'
+  sfProject: 'src/app/MPM.Exposure.Application/MPM.Exposure.Application.sfproj'
+  databaseProject: 'src/database/MPM.Exposure.Database/MPM.Exposure.Database.sqlproj'
+  buildProjects: '**/*.csproj'
+  unitTestProjects: '**/*UnitTests.csproj'
+  integrationTestProjects: '**/*IntegrationTests*.csproj'
+  e2etesting: 'test/services/MPM.Exposure.E2ETests/MPM.Exposure.E2ETests.csproj'
+
+jobs:
+  # Checkmarx One Scan
+  - job: 'Checkmarx_App_Scan'
+    condition: and(succeeded(), or(eq(variables['Build.Reason'], 'PullRequest'), eq(variables['Build.Reason'], 'Manual')))
+    steps:
+      - task: Checkmarx AST@2
+        inputs:
+          CheckmarxService: 'AGDATA to Checkmarx One Service Connection'
+          projectName: '$(Build.Repository.Name)'
+          branchName: '$(Build.SourceBranchName)'
+          tenantName: 'agdata'
+          additionalParams: '--sast-incremental --sast-fast-scan'
+
+  - job: 'Unit_Test'
+    steps:
+    - task: DotNetCoreCLI@2
+      displayName: Restore CS Packages
+      inputs:
+        command: restore
+        feedsToUse: config
+        nugetConfigPath: 'NuGet.config'
+        projects: |
+          $(unitTestProjects)
+        noCache: true
+        verbosityRestore: Normal
+    
+    - task: DotNetCoreCLI@2
+      displayName: Build CS Projects
+      inputs:
+        projects: |
+          $(unitTestProjects)
+        packDirectory: '$(Build.ArtifactStagingDirectory)'
+        arguments: '--configuration $(buildConfiguration) --no-restore /p:Platform=x64'
+
+    - task: DotNetCoreCLI@2
+      displayName: Run Unit Tests
+      inputs:
+        command: test
+        projects: $(unitTestProjects)
+        arguments: '--configuration $(buildConfiguration) --no-restore --no-build /p:Platform=x64 --collect "XPlat Code coverage" -- RunConfiguration.DisableAppDomain=true'
+
+    - task: CopyFiles@2
+      inputs:
+        SourceFolder: '$(Agent.TempDirectory)'
+        Contents: '**' 
+        TargetFolder: '$(Build.ArtifactStagingDirectory)/unitTestReport/'
+    
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish pipeline artifact'
+      inputs:
+        artifactName: 'unitTestReports'
+        targetPath: '$(Build.ArtifactStagingDirectory)/unitTestReport'
+
+  - job: 'Build_Solution'
+    steps:
+
+    - task: DotNetCoreCLI@2
+      displayName: Restore CS Packages
+      inputs:
+        command: restore
+        feedsToUse: config
+        nugetConfigPath: 'NuGet.config'
+        projects: |
+          $(buildProjects)
+          !$(unitTestProjects)
+          !$(integrationTestProjects)
+        noCache: true
+        verbosityRestore: Normal
+    
+    - task: NuGetCommand@2
+      displayName: Restore SF Packages
+      inputs:
+        restoreSolution: $(sfProject)
+        restoreDirectory: '$(System.DefaultWorkingDirectory)/packages'
+        feedsToUse: config
+        nugetConfigPath: nuget.config
+        noCache: true
+        verbosityRestore: Normal
+
+    - task: DotNetCoreCLI@2
+      displayName: Build CS Projects
+      inputs:
+        projects: |
+          $(buildProjects)
+          !$(unitTestProjects)
+          !$(integrationTestProjects)
+        packDirectory: '$(Build.ArtifactStagingDirectory)'
+        arguments: '--configuration $(buildConfiguration) --no-restore /p:Platform=x64'
+
+    - task: MSBuild@1
+      displayName: Build Database Project
+      inputs:
+        solution: $(databaseProject)
+        configuration: '$(BuildConfiguration)'
+        platform: 'x64'
+
+    - task: FileTransform@2
+      inputs:
+        folderPath: 
+        xmlTransformationRules: 
+        jsonTargetFiles: '**/testsettings.json'
+
+    - task: CopyFiles@2
+      condition: and(succeeded(),ne(variables['Build.Reason'], 'PullRequest'))
+      displayName: Copy DACPAC to Artifact Staging
+      inputs:
+        contents: |
+          **/*.dacpac
+          **/*.publish.xml
+        targetFolder: '$(Build.ArtifactStagingDirectory)/database'
+        flattenFolders: true
+
+    - task: DotNetCoreCLI@2
+      condition: and(succeeded(),ne(variables['Build.Reason'], 'PullRequest'))
+      displayName: Package SF Project
+      inputs:
+        projects: $(sfProject)
+        arguments: '--configuration $(buildConfiguration) --no-restore /p:Platform=x64 /t:Package /p:PackageLocation=$(Build.ArtifactStagingDirectory)/sf_app'
+
+    - task: PowerShell@2
+      condition: and(succeeded(),ne(variables['Build.Reason'], 'PullRequest'))
+      displayName: Move Release AppliationManifest.xml
+      inputs:
+        targetType: 'inline'
+        script: 'Move-Item -Path ApplicationManifest.Release.xml -Destination ApplicationManifest.xml -Force'
+        workingDirectory: '$(Build.ArtifactStagingDirectory)/sf_app'
+
+    - task: ServiceFabricUpdateManifests@2
+      condition: and(succeeded(),ne(variables['Build.Reason'], 'PullRequest'))
+      displayName: Update Service Fabric Version
+      inputs:
+        applicationPackagePath: '$(Build.ArtifactStagingDirectory)/sf_app'
+        versionSuffix: '$(Build.BuildNumber)'
+        versionBehavior: Replace
+
+    - task: DotNetCoreCLI@2
+      condition: and(succeeded(),ne(variables['Build.Reason'], 'PullRequest'))
+      displayName: 'Publish E2E Tests'
+      inputs:
+        command: 'publish'
+        publishWebProjects: false
+        projects: '**/MPM.Exposure.E2ETests.csproj'
+        arguments: '--configuration $(BuildConfiguration) --output $(Build.ArtifactStagingDirectory)/e2e_tests/ --no-restore'
+        zipAfterPublish: false
+
+    - task: PublishPipelineArtifact@1
+      condition: and(succeeded(),ne(variables['Build.Reason'], 'PullRequest'))
+      displayName: 'Publish pipeline artifact'
+      inputs:
+        artifactName: 'drop'
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+
+  - job: 'Build_Integration_Test'
+    steps:
+    - task: DotNetCoreCLI@2
+      displayName: Restore CS Packages
+      inputs:
+        command: restore
+        feedsToUse: config
+        nugetConfigPath: 'NuGet.config'
+        projects: |
+          $(integrationTestProjects)
+        noCache: true
+        verbosityRestore: Normal
+    
+    - task: DotNetCoreCLI@2
+      displayName: Build CS Projects
+      inputs:
+        projects: |
+          $(integrationTestProjects)
+        packDirectory: '$(Build.ArtifactStagingDirectory)'
+        arguments: '--configuration $(buildConfiguration) --no-restore /p:Platform=x64'
+    
+    - task: MSBuild@1
+      displayName: Build Database Project
+      inputs:
+        solution: $(databaseProject)
+        configuration: '$(BuildConfiguration)'
+        platform: 'x64'
+    
+    - task: FileTransform@2
+      inputs:
+        folderPath: 
+        xmlTransformationRules: 
+        jsonTargetFiles: '**/testsettings.json'
+    
+    - task: DotNetCoreCLI@2
+      displayName: Run Integration Tests
+      inputs:
+        command: test
+        projects: $(integrationTestProjects)
+        arguments: '--configuration $(buildConfiguration) --no-restore --no-build /p:Platform=x64 --collect "XPlat Code coverage" -- RunConfiguration.DisableAppDomain=true'
+
+    - task: CopyFiles@2
+      inputs:
+        SourceFolder: '$(Agent.TempDirectory)'
+        Contents: '**' 
+        TargetFolder: '$(Build.ArtifactStagingDirectory)/integrationTestreports/'
+    
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Unit Test Result'
+      inputs:
+        artifactName: 'integrationTestreports'
+        targetPath: '$(Build.ArtifactStagingDirectory)/integrationTestreports'
+
+  - job: MergeCoverageReports
+    dependsOn:
+      - Build_Integration_Test
+      - Unit_Test
+    steps:
+    - checkout: none
+    
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        source: 'current'
+        artifact: 'unitTestReports'
+        path: $(Agent.BuildDirectory)/unitTest_coverage
+
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        source: 'current'
+        artifact: 'integrationTestreports'
+        path: $(Agent.BuildDirectory)/integrationTest_coverage
+    
+    - script: 'reportgenerator -reports:$(Agent.BuildDirectory)/integrationTest_coverage/**/*.xml;$(Agent.BuildDirectory)/unitTest_coverage/**/*.xml -targetdir:$(Agent.BuildDirectory)/merged_coverage -reporttypes:"Cobertura"'
+      displayName: 'Create reports'
+    
+    - task: PublishCodeCoverageResults@2
+      displayName: 'Publish Merged Coverage'
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: '$(Agent.BuildDirectory)/merged_coverage/Cobertura.xml'
+        reportDirectory: '$(Agent.BuildDirectory)/merged_coverage'
